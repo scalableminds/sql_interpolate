@@ -1,0 +1,32 @@
+[workspace]
+members = ["macros"]
+
+[package]
+name = "sql_interpolate"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/scalableminds/sql_interpolate"
+description = "SQL queries for Postgres with inline value interpolation: q!(\"SELECT * FROM users WHERE id = ${id}\")"
+
+[features]
+default = []
+json = ["dep:serde_json"]
+chrono = ["dep:chrono", "sqlx/chrono"]
+uuid = ["dep:uuid", "sqlx/uuid"]
+
+[dependencies]
+sql_interpolate_macros = { path = "macros", version = "0.1.0" }
+sqlx = { version = "0.9", default-features = false, features = ["postgres"] }
+serde_json = { version = "1", optional = true }
+chrono = { version = "0.4", optional = true, default-features = false }
+uuid = { version = "1", optional = true }
+
+[dev-dependencies]
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
+
+[[test]]
+name = "postgres"
+required-features = ["json"]

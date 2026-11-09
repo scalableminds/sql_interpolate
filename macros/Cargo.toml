@@ -1,0 +1,15 @@
+[package]
+name = "sql_interpolate_macros"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/scalableminds/sql_interpolate"
+description = "Proc macro for sql_interpolate. Use the sql_interpolate crate instead."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
