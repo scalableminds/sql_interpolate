@@ -9,6 +9,7 @@ use sqlx::postgres::{PgArgumentBuffer, PgArguments, PgTypeInfo, Postgres};
 use sqlx::{Arguments, Encode, Type};
 
 use crate::escape::escape_literal;
+use crate::token::Part;
 
 /// A value that can be interpolated into a query as a bind parameter.
 ///
@@ -25,9 +26,18 @@ pub trait SqlValue: Send + Sync {
 
     /// The value as an SQL literal, for [`SqlToken::debug_info`](crate::SqlToken::debug_info).
     fn debug_info(&self) -> String;
+
+    /// How the value is stored in a token. Owned values are reference-counted, references are kept as they are.
+    #[doc(hidden)]
+    fn __into_part<'a>(self) -> Part<'a>
+    where
+        Self: Sized + 'a,
+    {
+        Part::owned(self)
+    }
 }
 
-impl<T: SqlValue + ?Sized> SqlValue for &T {
+impl<T: SqlValue> SqlValue for &T {
     fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
         (**self).bind(arguments)
     }
@@ -36,6 +46,27 @@ impl<T: SqlValue + ?Sized> SqlValue for &T {
     }
     fn debug_info(&self) -> String {
         (**self).debug_info()
+    }
+    fn __into_part<'a>(self) -> Part<'a>
+    where
+        Self: 'a,
+    {
+        Part::Borrowed(self)
+    }
+}
+
+impl SqlValue for &str {
+    fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
+        arguments.add(*self)
+    }
+    fn debug_info(&self) -> String {
+        escape_literal(self)
+    }
+    fn __into_part<'a>(self) -> Part<'a>
+    where
+        Self: 'a,
+    {
+        Part::Str(self)
     }
 }
 
@@ -65,6 +96,16 @@ impl<T: SqlValue + ?Sized> SqlValue for Arc<T> {
 
 /// `None` is bound as an untyped `NULL`, so Postgres infers its type from the context.
 impl<T: SqlValue> SqlValue for Option<T> {
+    fn __into_part<'a>(self) -> Part<'a>
+    where
+        Self: 'a,
+    {
+        match self {
+            Some(value) => value.__into_part(),
+            None => Part::Scalar(Scalar::Null),
+        }
+    }
+
     fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
         match self {
             Some(value) => value.bind(arguments),
@@ -82,43 +123,72 @@ impl<T: SqlValue> SqlValue for Option<T> {
     }
 }
 
-macro_rules! impl_sql_value_for_integers {
-    ($($t:ty),*) => {$(
-        impl SqlValue for $t {
-            fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
-                arguments.add(*self)
-            }
-            fn debug_info(&self) -> String {
-                self.to_string()
-            }
-        }
-    )*};
+/// Small `Copy` values (and `NULL`), which tokens store inline instead of allocating.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub enum Scalar {
+    Null,
+    Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
 }
-impl_sql_value_for_integers!(bool, i8, i16, i32, i64);
 
-macro_rules! impl_sql_value_for_floats {
-    ($($t:ty),*) => {$(
-        impl SqlValue for $t {
-            fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
-                arguments.add(*self)
-            }
-            fn debug_info(&self) -> String {
-                // NaN and infinities are only valid SQL as quoted literals
-                if self.is_finite() { self.to_string() } else { format!("'{self}'") }
-            }
-        }
-    )*};
-}
-impl_sql_value_for_floats!(f32, f64);
-
-impl SqlValue for str {
+impl SqlValue for Scalar {
     fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
-        arguments.add(self)
+        match *self {
+            Scalar::Null => arguments.add(Untyped(None)),
+            Scalar::Bool(v) => arguments.add(v),
+            Scalar::I8(v) => arguments.add(v),
+            Scalar::I16(v) => arguments.add(v),
+            Scalar::I32(v) => arguments.add(v),
+            Scalar::I64(v) => arguments.add(v),
+            Scalar::F32(v) => arguments.add(v),
+            Scalar::F64(v) => arguments.add(v),
+        }
     }
     fn debug_info(&self) -> String {
-        escape_literal(self)
+        match self {
+            Scalar::Null => "NULL".to_owned(),
+            Scalar::Bool(v) => v.to_string(),
+            Scalar::I8(v) => v.to_string(),
+            Scalar::I16(v) => v.to_string(),
+            Scalar::I32(v) => v.to_string(),
+            Scalar::I64(v) => v.to_string(),
+            Scalar::F32(v) => float_debug_info(*v),
+            Scalar::F64(v) => float_debug_info(*v),
+        }
     }
 }
+
+fn float_debug_info<F: std::fmt::Display + Into<f64> + Copy>(v: F) -> String {
+    // NaN and infinities are only valid SQL as quoted literals
+    if v.into().is_finite() {
+        v.to_string()
+    } else {
+        format!("'{v}'")
+    }
+}
+
+macro_rules! impl_sql_value_for_scalars {
+    ($($t:ty => $variant:ident),*) => {$(
+        impl SqlValue for $t {
+            fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
+                Scalar::$variant(*self).bind(arguments)
+            }
+            fn debug_info(&self) -> String {
+                Scalar::$variant(*self).debug_info()
+            }
+            fn __into_part<'a>(self) -> Part<'a> {
+                Part::Scalar(Scalar::$variant(self))
+            }
+        }
+    )*};
+}
+impl_sql_value_for_scalars!(bool => Bool, i8 => I8, i16 => I16, i32 => I32, i64 => I64, f32 => F32, f64 => F64);
 
 impl SqlValue for String {
     fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
@@ -138,7 +208,7 @@ impl SqlValue for Cow<'_, str> {
     }
 }
 
-impl SqlValue for [u8] {
+impl SqlValue for &[u8] {
     fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
         arguments.add(self)
     }
@@ -150,7 +220,7 @@ impl SqlValue for [u8] {
 
 impl SqlValue for Vec<u8> {
     fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
-        self.as_slice().bind(arguments)
+        arguments.add(self.as_slice())
     }
     fn debug_info(&self) -> String {
         self.as_slice().debug_info()
@@ -170,7 +240,7 @@ impl SqlValue for std::time::Duration {
 /// Postgres arrays, e.g. for `WHERE _id = ANY(${ids})`.
 macro_rules! impl_sql_value_for_arrays {
     ($($t:ty),*) => {$(
-        impl SqlValue for [$t] {
+        impl SqlValue for &[$t] {
             fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
                 arguments.add(self)
             }
@@ -181,7 +251,7 @@ macro_rules! impl_sql_value_for_arrays {
 
         impl SqlValue for Vec<$t> {
             fn bind(&self, arguments: &mut PgArguments) -> Result<(), BoxDynError> {
-                self.as_slice().bind(arguments)
+                arguments.add(self.as_slice())
             }
             fn debug_info(&self) -> String {
                 self.as_slice().debug_info()

@@ -27,16 +27,19 @@ fn expand(lit: &LitStr) -> syn::Result<TokenStream2> {
 
     // mixed_site hygiene: the user's expressions cannot accidentally refer to this variable
     let token = proc_macro2::Ident::new("__sql_token", Span::mixed_site());
-    let statements = segments.into_iter().map(|segment| match segment {
+    let capacity = segments.len();
+    let statements = segments.into_iter().enumerate().map(|(i, segment)| match segment {
         Segment::Sql(sql) => quote! { #token.push_sql(#sql); },
         Segment::Expr(expr) => {
-            quote! { ::sql_interpolate::IntoSqlToken::append_to(#expr, &mut #token); }
+            // A spliced token reserves room for itself and everything after it, so it reallocates once at most
+            let remaining = capacity - i - 1;
+            quote! { ::sql_interpolate::IntoSqlToken::__append(#expr, &mut #token, #remaining); }
         }
     });
 
     Ok(quote! {
         {
-            let mut #token = ::sql_interpolate::SqlToken::new();
+            let mut #token = ::sql_interpolate::SqlToken::with_capacity(#capacity);
             #(#statements)*
             #token
         }

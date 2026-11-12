@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::fmt;
+use std::fmt::{self, Write};
 use std::sync::Arc;
 
 use sqlx::error::BoxDynError;
@@ -9,7 +9,7 @@ use sqlx::query::{Query, QueryAs, QueryScalar};
 use sqlx::{AssertSqlSafe, Executor, FromRow};
 
 use crate::escape::quote_identifier;
-use crate::value::SqlValue;
+use crate::value::{Scalar, SqlValue};
 
 /// A piece of SQL together with the values bound in it. Usually built with [`q!`](crate::q).
 ///
@@ -19,15 +19,46 @@ pub struct SqlToken<'a> {
     parts: Vec<Part<'a>>,
 }
 
+#[doc(hidden)]
 #[derive(Clone)]
-enum Part<'a> {
+pub enum Part<'a> {
     Sql(Cow<'a, str>),
-    Value(Arc<dyn SqlValue + 'a>),
+    /// An owned value, reference-counted so that tokens stay cheap to clone.
+    Owned(Arc<dyn SqlValue + 'a>),
+    /// A borrowed value: interpolating references allocates nothing.
+    Borrowed(&'a (dyn SqlValue + 'a)),
+    Str(&'a str),
+    /// A small `Copy` value or `NULL`, stored inline.
+    Scalar(Scalar),
+}
+
+impl<'a> Part<'a> {
+    pub(crate) fn owned(value: impl SqlValue + 'a) -> Self {
+        Part::Owned(Arc::new(value))
+    }
+
+    fn value(&self) -> Option<&dyn SqlValue> {
+        match self {
+            Part::Sql(_) => None,
+            Part::Owned(value) => Some(value.as_ref()),
+            Part::Borrowed(value) => Some(*value),
+            Part::Str(value) => Some(value),
+            Part::Scalar(value) => Some(value),
+        }
+    }
 }
 
 impl<'a> SqlToken<'a> {
     pub fn new() -> Self {
         Self { parts: Vec::new() }
+    }
+
+    /// Used by [`q!`](crate::q), which knows how many parts it pushes.
+    #[doc(hidden)]
+    pub fn with_capacity(parts: usize) -> Self {
+        Self {
+            parts: Vec::with_capacity(parts),
+        }
     }
 
     /// SQL that is included verbatim. Never pass user input here.
@@ -40,7 +71,7 @@ impl<'a> SqlToken<'a> {
     /// A single bind parameter.
     pub fn value(value: impl SqlValue + 'a) -> Self {
         let mut token = Self::new();
-        token.parts.push(Part::Value(Arc::new(value)));
+        token.parts.push(value.__into_part());
         token
     }
 
@@ -50,11 +81,15 @@ impl<'a> SqlToken<'a> {
     }
 
     /// Joins tokens (or values) with a separator that is included verbatim.
-    pub fn join<T: IntoSqlToken<'a>>(items: impl IntoIterator<Item = T>, separator: &str) -> Self {
-        let mut token = Self::new();
-        for (i, item) in items.into_iter().enumerate() {
+    pub fn join<T: IntoSqlToken<'a>>(
+        items: impl IntoIterator<Item = T>,
+        separator: &'a str,
+    ) -> Self {
+        let items = items.into_iter();
+        let mut token = Self::with_capacity(2 * items.size_hint().0);
+        for (i, item) in items.enumerate() {
             if i > 0 {
-                token.push_sql(separator.to_owned());
+                token.push_sql(separator);
             }
             item.append_to(&mut token);
         }
@@ -69,8 +104,10 @@ impl<'a> SqlToken<'a> {
     ///
     /// Note that `IN ()` is invalid SQL, so handle empty lists separately (or use `= ANY(${array})`).
     pub fn tuple<T: IntoSqlToken<'a>>(items: impl IntoIterator<Item = T>) -> Self {
-        let mut token = Self::raw("(");
-        Self::join_by_comma(items).append_to(&mut token);
+        let list = Self::join_by_comma(items);
+        let mut token = Self::with_capacity(list.parts.len() + 2);
+        token.push_sql("(");
+        list.append_to(&mut token);
         token.push_sql(")");
         token
     }
@@ -96,12 +133,12 @@ impl<'a> SqlToken<'a> {
         let mut sql = String::new();
         let mut index = 0;
         for part in &self.parts {
-            match part {
-                Part::Sql(s) => sql.push_str(s),
-                Part::Value(value) => {
+            match part.value() {
+                Some(value) => {
                     index += 1;
-                    push_placeholder(&mut sql, index, value.as_ref());
+                    push_placeholder(&mut sql, index, value);
                 }
+                None => push_sql_part(&mut sql, part),
             }
         }
         sql
@@ -109,17 +146,26 @@ impl<'a> SqlToken<'a> {
 
     /// The SQL and its bind arguments, for use with [`sqlx::query_with`] and friends.
     pub fn build(&self) -> Result<(String, PgArguments), BoxDynError> {
-        let mut sql = String::new();
+        let (sql_len, value_count) =
+            self.parts
+                .iter()
+                .fold((0, 0), |(len, count), part| match part {
+                    Part::Sql(s) => (len + s.len(), count),
+                    _ => (len + 4, count + 1),
+                });
+        let mut sql = String::with_capacity(sql_len);
         let mut arguments = PgArguments::default();
+        // the size is only a hint for the argument buffer
+        sqlx::Arguments::reserve(&mut arguments, value_count, value_count * 32);
         let mut index = 0;
         for part in &self.parts {
-            match part {
-                Part::Sql(s) => sql.push_str(s),
-                Part::Value(value) => {
+            match part.value() {
+                Some(value) => {
                     index += 1;
-                    push_placeholder(&mut sql, index, value.as_ref());
+                    push_placeholder(&mut sql, index, value);
                     value.bind(&mut arguments)?;
                 }
+                None => push_sql_part(&mut sql, part),
             }
         }
         Ok((sql, arguments))
@@ -130,9 +176,9 @@ impl<'a> SqlToken<'a> {
     pub fn debug_info(&self) -> String {
         let mut sql = String::new();
         for part in &self.parts {
-            match part {
-                Part::Sql(s) => sql.push_str(s),
-                Part::Value(value) => {
+            match part.value() {
+                None => push_sql_part(&mut sql, part),
+                Some(value) => {
                     sql.push_str(&value.debug_info());
                     if let Some(cast) = value.cast() {
                         sql.push_str("::");
@@ -206,9 +252,15 @@ impl<'a> SqlToken<'a> {
     }
 }
 
+fn push_sql_part(sql: &mut String, part: &Part<'_>) {
+    if let Part::Sql(s) = part {
+        sql.push_str(s);
+    }
+}
+
 fn push_placeholder(sql: &mut String, index: usize, value: &dyn SqlValue) {
-    sql.push('$');
-    sql.push_str(&index.to_string());
+    // writing to a String cannot fail
+    let _ = write!(sql, "${index}");
     if let Some(cast) = value.cast() {
         sql.push_str("::");
         sql.push_str(&cast);
@@ -232,11 +284,31 @@ impl fmt::Display for SqlToken<'_> {
 /// [`SqlValue`]s become bind parameters.
 pub trait IntoSqlToken<'a> {
     fn append_to(self, token: &mut SqlToken<'a>);
+
+    /// How many parts [`append_to`](Self::append_to) adds, so tokens can be allocated with their final size.
+    fn part_count(&self) -> usize;
+
+    /// Used by [`q!`](crate::q): appends, first reserving room for `remaining` more parts after this one.
+    #[doc(hidden)]
+    fn __append(self, token: &mut SqlToken<'a>, remaining: usize)
+    where
+        Self: Sized,
+    {
+        let needed = self.part_count() + remaining;
+        let spare = token.parts.capacity() - token.parts.len();
+        if needed > spare {
+            token.parts.reserve_exact(needed);
+        }
+        self.append_to(token);
+    }
 }
 
 impl<'a> IntoSqlToken<'a> for SqlToken<'a> {
     fn append_to(self, token: &mut SqlToken<'a>) {
         token.parts.extend(self.parts);
+    }
+    fn part_count(&self) -> usize {
+        self.parts.len()
     }
 }
 
@@ -244,10 +316,16 @@ impl<'a> IntoSqlToken<'a> for &SqlToken<'a> {
     fn append_to(self, token: &mut SqlToken<'a>) {
         token.parts.extend(self.parts.iter().cloned());
     }
+    fn part_count(&self) -> usize {
+        self.parts.len()
+    }
 }
 
 impl<'a, T: SqlValue + 'a> IntoSqlToken<'a> for T {
     fn append_to(self, token: &mut SqlToken<'a>) {
-        token.parts.push(Part::Value(Arc::new(self)));
+        token.parts.push(self.__into_part());
+    }
+    fn part_count(&self) -> usize {
+        1
     }
 }
